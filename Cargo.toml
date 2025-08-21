@@ -1,0 +1,16 @@
+[package]
+name = "hrm"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Oleksandr Knyshuk <olk@disr.it>"]
+
+[dependencies]
+burn = { version = "~0.18", features = [
+    "std",
+    "tui",
+    "train",
+    "vision",
+    "wgpu",
+    "fusion",
+], default-features = false }
