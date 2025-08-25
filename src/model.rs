@@ -18,6 +18,8 @@ use burn::nn::{
 };
 use burn::tensor::{Int, Tensor, backend::Backend};
 
+use crate::sparse_embedding::{SparseEmbedding, SparseEmbeddingConfig};
+
 /// Configuration for the Hierarchical Reasoning Model
 #[derive(Config, Debug)]
 pub struct HierarchicalReasoningModelConfig {
@@ -176,6 +178,8 @@ pub struct HierarchicalReasoningModel<B: Backend> {
     pub embed_tokens: Embedding<B>,
     /// Position embeddings (for learned positional encoding)
     pub embed_pos: Option<Embedding<B>>,
+    /// Puzzle embeddings (sparse, for puzzle identifiers)
+    pub puzzle_emb: Option<SparseEmbedding<B>>,
     /// H-level reasoning module
     pub h_level: ReasoningModule<B>,
     /// L-level reasoning module
@@ -211,18 +215,37 @@ impl<B: Backend> ModuleDisplay for HierarchicalReasoningModel<B> {
 impl HierarchicalReasoningModelConfig {
     /// Initialize the hierarchical reasoning model
     pub fn init<B: Backend>(&self, device: &B::Device) -> HierarchicalReasoningModel<B> {
+        let _embed_scale = (self.hidden_size as f64).sqrt();
+
         // Token embeddings
         let embed_tokens = EmbeddingConfig::new(self.vocab_size, self.hidden_size).init(device);
 
         // Position embeddings (if using learned positional encoding)
-        let _puzzle_emb_len = if self.puzzle_emb_ndim > 0 {
+        let puzzle_emb_len = if self.puzzle_emb_ndim > 0 {
             (self.puzzle_emb_ndim + self.hidden_size - 1) / self.hidden_size // ceil division
         } else {
             0
         };
 
         let embed_pos = if self.pos_encodings == "learned" {
-            Some(EmbeddingConfig::new(self.seq_len, self.hidden_size).init(device))
+            // Total sequence length includes puzzle tokens
+            let total_seq_len = self.seq_len + puzzle_emb_len;
+            Some(EmbeddingConfig::new(total_seq_len, self.hidden_size).init(device))
+        } else {
+            None
+        };
+
+        // Puzzle embeddings (sparse, zero-initialized)
+        let puzzle_emb = if self.puzzle_emb_ndim > 0 {
+            // Use a much smaller embedding table - just 1 identifier for blank
+            // Fix: Don't use batch_size here, use actual number of puzzle identifiers
+            let config = SparseEmbeddingConfig::new(
+                self.num_puzzle_identifiers, // Use actual number of identifiers
+                self.puzzle_emb_ndim,
+                self.batch_size, // This is for local weights, not global
+            )
+            .with_init_std(0.0); // Zero initialization for puzzle embeddings
+            Some(config.init(device))
         } else {
             None
         };
@@ -255,6 +278,7 @@ impl HierarchicalReasoningModelConfig {
         HierarchicalReasoningModel {
             embed_tokens,
             embed_pos,
+            puzzle_emb,
             h_level,
             l_level,
             lm_head,
@@ -321,17 +345,63 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
         }
     }
 
-    /// Input embedding computation
+    /// Input embedding computation with puzzle embeddings support
     pub fn input_embeddings(&self, input: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        self.input_embeddings_with_puzzle(input, None)
+    }
+
+    /// Input embedding computation with optional puzzle identifiers
+    pub fn input_embeddings_with_puzzle(
+        &self,
+        input: Tensor<B, 2, Int>,
+        puzzle_identifiers: Option<Tensor<B, 1, Int>>,
+    ) -> Tensor<B, 3> {
         // Token embeddings
         let mut embeddings = self.embed_tokens.forward(input);
 
-        // Position embeddings (if using learned)
+        // Add puzzle embeddings if present
+        if let (Some(puzzle_emb), Some(puzzle_ids)) = (&self.puzzle_emb, puzzle_identifiers) {
+            let batch_size = embeddings.dims()[0];
+            let hidden_size = embeddings.dims()[2];
+
+            // Get puzzle embeddings using actual puzzle_ids (not zeros)
+            let puzzle_embeddings = puzzle_emb.forward(puzzle_ids);
+            let puzzle_emb_dim = puzzle_embeddings.dims()[1];
+
+            // Calculate puzzle_emb_len: -(puzzle_emb_ndim // -hidden_size)
+            let puzzle_emb_len = (puzzle_emb_dim + hidden_size - 1) / hidden_size; // ceil division
+
+            if puzzle_emb_len > 0 && puzzle_emb_dim > 0 {
+                // Pad puzzle embeddings to fit evenly into tokens
+                let target_size = puzzle_emb_len * hidden_size;
+
+                let puzzle_flat = if puzzle_emb_dim < target_size {
+                    let pad_size = target_size - puzzle_emb_dim;
+                    // Pad the last dimension: [batch_size, puzzle_emb_dim] -> [batch_size, target_size]
+                    // For 2D tensor [batch, emb], padding format is (left, right, top, bottom)
+                    // We want to pad the embedding dimension (right side): (0, pad_size, 0, 0)
+                    puzzle_embeddings.pad((0, pad_size, 0, 0), 0.0)
+                } else if puzzle_emb_dim > target_size {
+                    puzzle_embeddings.slice([0..batch_size, 0..target_size])
+                } else {
+                    puzzle_embeddings
+                };
+
+                // Reshape to sequence format [batch, puzzle_emb_len, hidden_size]
+                let puzzle_reshaped =
+                    puzzle_flat.reshape([batch_size, puzzle_emb_len, hidden_size]);
+
+                // Concatenate puzzle embeddings BEFORE token embeddings
+                embeddings = Tensor::cat(vec![puzzle_reshaped, embeddings], 1);
+            }
+        }
+
+        // Position embeddings (if using learned) - applied to FULL sequence including puzzle tokens
         if let Some(ref embed_pos) = self.embed_pos {
             let seq_len = embeddings.dims()[1];
             let batch_size = embeddings.dims()[0];
 
-            // Create position indices
+            // Create position indices for the full sequence length
             let positions = Tensor::arange(0..seq_len as i64, &embeddings.device())
                 .unsqueeze_dim::<2>(0)
                 .repeat_dim(0, batch_size);
@@ -342,7 +412,7 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
             embeddings = embeddings * 0.707106781 + pos_embeddings * 0.707106781;
         }
 
-        // Scale embeddings
+        // Scale embeddings by sqrt(hidden_size)
         let embed_scale = (embeddings.dims()[2] as f64).sqrt();
         embeddings * embed_scale
     }
@@ -355,8 +425,20 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
         h_cycles: usize,
         l_cycles: usize,
     ) -> (InnerCarry<B>, Tensor<B, 3>, (Tensor<B, 1>, Tensor<B, 1>)) {
-        // Input embeddings
-        let input_embeddings = self.input_embeddings(input);
+        self.forward_with_puzzle(carry, input, None, h_cycles, l_cycles)
+    }
+
+    /// Forward pass with puzzle identifiers
+    pub fn forward_with_puzzle(
+        &self,
+        carry: InnerCarry<B>,
+        input: Tensor<B, 2, Int>,
+        puzzle_identifiers: Option<Tensor<B, 1, Int>>,
+        h_cycles: usize,
+        l_cycles: usize,
+    ) -> (InnerCarry<B>, Tensor<B, 3>, (Tensor<B, 1>, Tensor<B, 1>)) {
+        // Input embeddings with puzzle support
+        let input_embeddings = self.input_embeddings_with_puzzle(input, puzzle_identifiers.clone());
 
         // Get current states
         let mut z_h = carry.z_h;
@@ -390,10 +472,35 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
         z_l = self.l_level.forward(z_l, z_h.clone() + input_embeddings);
         z_h = self.h_level.forward(z_h, z_l.clone());
 
-        // Output predictions
-        let lm_output = self.lm_head.forward(z_h.clone());
+        // Output predictions (skip puzzle embedding tokens if present)
+        let puzzle_emb_len = if puzzle_identifiers.is_some() {
+            if let Some(puzzle_emb) = &self.puzzle_emb {
+                let puzzle_emb_dim = puzzle_emb.global_weights.dims()[1];
+                let hidden_size = z_h.dims()[2];
+                if puzzle_emb_dim > 0 {
+                    (puzzle_emb_dim + hidden_size - 1) / hidden_size // ceil division
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
-        // Q-values from first token
+        let lm_output = if puzzle_emb_len > 0 {
+            // Skip puzzle embedding tokens in output
+            self.lm_head.forward(z_h.clone().slice([
+                0..z_h.dims()[0],
+                puzzle_emb_len..z_h.dims()[1],
+                0..z_h.dims()[2],
+            ]))
+        } else {
+            self.lm_head.forward(z_h.clone())
+        };
+
+        // Q-values from first token (always position 0, before any puzzle tokens)
         let first_token_repr: Tensor<B, 2> = z_h
             .clone()
             .slice([0..z_h.dims()[0], 0..1, 0..z_h.dims()[2]])

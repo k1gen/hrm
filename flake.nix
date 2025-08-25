@@ -37,6 +37,8 @@
             );
             commonArgs = {
               src = craneLib.cleanCargoSource (craneLib.path ./.);
+              nativeBuildInputs = [ pkgs.mold ];
+              RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
             };
           };
 
@@ -57,11 +59,15 @@
               pkgs.rust-bin.${rustChannel}.${rustVersion}.rust-src
             }/lib/rustlib/src/rust/library";
 
-            LD_LIBRARY_PATH = lib.makeLibraryPath [
-              pkgs.vulkan-loader
-              pkgs.libxkbcommon
-              pkgs.wayland
-            ];
+            inherit (commonArgs) RUSTFLAGS;
+
+            LD_LIBRARY_PATH =
+              with pkgs;
+              lib.makeLibraryPath [
+                vulkan-loader
+                libxkbcommon
+                wayland
+              ];
           };
 
           treefmt = {

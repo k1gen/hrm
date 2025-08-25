@@ -6,11 +6,13 @@ license = "Apache-2.0"
 authors = ["Oleksandr Knyshuk <olk@disr.it>"]
 
 [dependencies]
-burn = { version = "~0.18", features = [
-    "std",
-    "tui",
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "d7aa94f", features = [
     "train",
-    "vision",
     "wgpu",
     "fusion",
-], default-features = false }
+    "tui",
+    "metrics",
+] }
+serde = { version = "1.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive"] }
+csv = "1.3"
