@@ -20,6 +20,7 @@
       perSystem =
         {
           system,
+          lib,
           pkgs,
           craneLib,
           commonArgs,
@@ -36,11 +37,6 @@
             );
             commonArgs = {
               src = craneLib.cleanCargoSource (craneLib.path ./.);
-
-              # buildInputs = with pkgs; [
-              #   pkg-config
-              #   mkl
-              # ];
             };
           };
 
@@ -60,12 +56,17 @@
             RUST_SRC_PATH = "${
               pkgs.rust-bin.${rustChannel}.${rustVersion}.rust-src
             }/lib/rustlib/src/rust/library";
+
+            LD_LIBRARY_PATH = lib.makeLibraryPath [
+              pkgs.vulkan-loader
+              pkgs.libxkbcommon
+              pkgs.wayland
+            ];
           };
 
           treefmt = {
             projectRootFile = "Cargo.toml";
             programs = {
-              # actionlint.enable = true;
               nixfmt.enable = true;
               rustfmt.enable = true;
             };
