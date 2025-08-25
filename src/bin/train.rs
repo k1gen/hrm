@@ -30,32 +30,36 @@ struct Args {
     batch_size: usize,
 
     /// Learning rate
-    #[arg(long, default_value = "1e-4")]
+    #[arg(long, default_value = "7e-5")]
     learning_rate: f64,
 
     /// Hidden size
-    #[arg(long, default_value = "512")]
+    #[arg(long, default_value = "256")]
     hidden_size: usize,
 
     /// Number of attention heads
-    #[arg(long, default_value = "8")]
+    #[arg(long, default_value = "4")]
     num_heads: usize,
 
     /// Number of H-level layers
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value = "2")]
     h_layers: usize,
 
     /// Number of L-level layers
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value = "2")]
     l_layers: usize,
 
     /// Cache directory for HuggingFace datasets
-    #[arg(long)]
+    #[arg(long, default_value = "/tmp/sudoku_cache")]
     cache_dir: Option<PathBuf>,
 
     /// Random seed
     #[arg(long, default_value = "42")]
     seed: u64,
+
+    /// Number of data augmentations per training puzzle
+    #[arg(long, default_value = "4")]
+    num_aug: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -80,13 +84,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .cache_dir
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
-        subsample_size: Some(1000), // Limit training data for testing
+        subsample_size: Some(1000), // Keep training data reasonable for testing
         min_difficulty: None,
+        num_aug: args.num_aug,
     };
 
     let test_config = SudokuDatasetConfig {
         split: "test".to_string(),
-        subsample_size: Some(100), // Limit test data for testing
+        subsample_size: Some(100), // Keep test data small for fast validation
+        num_aug: 0,                // No augmentation for test set
         ..train_config.clone()
     };
 
@@ -103,16 +109,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create model configuration
     let model_config = HierarchicalReasoningModelConfig {
         batch_size: args.batch_size,
-        seq_len: 81,    // 9x9 Sudoku grid
-        vocab_size: 11, // PAD + empty + digits 1-9
-        num_puzzle_identifiers: 1,
+        seq_len: 81,   // 9x9 Sudoku grid
+        vocab_size: 9, // Digits 1-9 (classes 0-8) - no pad token needed
         hidden_size: args.hidden_size,
         num_heads: args.num_heads,
         h_layers: args.h_layers,
         l_layers: args.l_layers,
         h_cycles: 2,
         l_cycles: 2,
-        puzzle_emb_ndim: 0, // Disable puzzle embeddings for Sudoku
         expansion: 2.666,
         pos_encodings: "rope".to_string(),
         rms_norm_eps: 1e-5,
@@ -126,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let training_config = HrmTrainingConfig {
         model: model_config,
         optimizer: burn::optim::AdamConfig::new()
-            .with_weight_decay(Some(burn::optim::decay::WeightDecayConfig::new(1e-4)))
+            .with_weight_decay(Some(burn::optim::decay::WeightDecayConfig::new(1.0)))
             .with_epsilon(1e-8)
             .with_beta_1(0.9)
             .with_beta_2(0.95),

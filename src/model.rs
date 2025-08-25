@@ -10,15 +10,14 @@
 //! - Learned or rotary position encodings
 //! - Configurable transformer blocks with post-norm architecture
 
+use crate::attention::{
+    CustomAttention, CustomAttentionConfig, CustomSwiGlu, CustomSwiGluConfig, RotaryEmbedding,
+    RotaryEmbeddingConfig,
+};
 use burn::config::Config;
 use burn::module::{Content, DisplaySettings, Module, ModuleDisplay, Param};
-use burn::nn::{
-    Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, SwiGlu, SwiGluConfig,
-    attention::{MultiHeadAttention, MultiHeadAttentionConfig},
-};
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::tensor::{Int, Tensor, backend::Backend};
-
-use crate::sparse_embedding::{SparseEmbedding, SparseEmbeddingConfig};
 
 /// Configuration for the Hierarchical Reasoning Model
 #[derive(Config, Debug)]
@@ -29,8 +28,7 @@ pub struct HierarchicalReasoningModelConfig {
     pub seq_len: usize,
     /// Vocabulary size
     pub vocab_size: usize,
-    /// Number of puzzle identifiers
-    pub num_puzzle_identifiers: usize,
+
     /// Hidden dimension size
     pub hidden_size: usize,
     /// Number of attention heads
@@ -43,9 +41,6 @@ pub struct HierarchicalReasoningModelConfig {
     pub h_cycles: usize,
     /// Number of L-level cycles
     pub l_cycles: usize,
-    /// Puzzle embedding dimension (0 to disable)
-    #[config(default = 0)]
-    pub puzzle_emb_ndim: usize,
     /// MLP expansion factor
     #[config(default = 2.666)]
     pub expansion: f64,
@@ -74,9 +69,9 @@ impl HierarchicalReasoningModelConfig {}
 #[derive(Module, Debug)]
 pub struct TransformerBlock<B: Backend> {
     /// Self-attention mechanism
-    pub self_attn: MultiHeadAttention<B>,
+    pub self_attn: CustomAttention<B>,
     /// MLP layer
-    pub mlp: SwiGlu<B>,
+    pub mlp: CustomSwiGlu<B>,
     /// RMS normalization after attention
     pub norm1: RmsNorm<B>,
     /// RMS normalization after MLP
@@ -85,13 +80,18 @@ pub struct TransformerBlock<B: Backend> {
 
 impl<B: Backend> TransformerBlock<B> {
     pub fn new(config: &HierarchicalReasoningModelConfig, device: &B::Device) -> Self {
-        let _head_dim = config.hidden_size / config.num_heads;
+        let head_dim = config.hidden_size / config.num_heads;
 
-        let self_attn = MultiHeadAttentionConfig::new(config.hidden_size, config.num_heads)
-            .with_dropout(config.dropout)
-            .init(device);
+        let self_attn = CustomAttentionConfig::new(
+            config.hidden_size,
+            head_dim,
+            config.num_heads,
+            config.num_heads, // num_key_value_heads = num_heads for standard MHA
+        )
+        .with_dropout(config.dropout)
+        .init(device);
 
-        let mlp = SwiGluConfig::new(config.hidden_size, config.hidden_size).init(device);
+        let mlp = CustomSwiGluConfig::new(config.hidden_size, config.expansion).init(device);
 
         let norm1 = RmsNormConfig::new(config.hidden_size)
             .with_epsilon(config.rms_norm_eps)
@@ -109,20 +109,22 @@ impl<B: Backend> TransformerBlock<B> {
         }
     }
 
-    pub fn forward(&self, hidden_states: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(
+        &self,
+        hidden_states: Tensor<B, 3>,
+        cos_sin: Option<(Tensor<B, 2>, Tensor<B, 2>)>,
+    ) -> Tensor<B, 3> {
         // Post-norm architecture: residual -> layer -> norm
 
         // Self-attention with residual connection
-        let attn_input = hidden_states.clone();
-        let mha_input = burn::nn::attention::MhaInput::self_attn(attn_input);
-        let attn_output = self.self_attn.forward(mha_input);
-        let hidden_states = self.norm1.forward(hidden_states + attn_output.context);
+        let attn_output = self.self_attn.forward(hidden_states.clone(), cos_sin);
+        let hidden_states = self.norm1.forward(hidden_states + attn_output);
 
         // MLP with residual connection
         let mlp_output = self.mlp.forward(hidden_states.clone());
-        let hidden_states = self.norm2.forward(hidden_states + mlp_output);
+        
 
-        hidden_states
+        self.norm2.forward(hidden_states + mlp_output)
     }
 }
 
@@ -150,13 +152,14 @@ impl<B: Backend> ReasoningModule<B> {
         &self,
         mut hidden_states: Tensor<B, 3>,
         input_injection: Tensor<B, 3>,
+        cos_sin: Option<(Tensor<B, 2>, Tensor<B, 2>)>,
     ) -> Tensor<B, 3> {
         // Add input injection
         hidden_states = hidden_states + input_injection;
 
         // Pass through all layers
         for layer in &self.layers {
-            hidden_states = layer.forward(hidden_states);
+            hidden_states = layer.forward(hidden_states, cos_sin.clone());
         }
 
         hidden_states
@@ -178,8 +181,8 @@ pub struct HierarchicalReasoningModel<B: Backend> {
     pub embed_tokens: Embedding<B>,
     /// Position embeddings (for learned positional encoding)
     pub embed_pos: Option<Embedding<B>>,
-    /// Puzzle embeddings (sparse, for puzzle identifiers)
-    pub puzzle_emb: Option<SparseEmbedding<B>>,
+    /// Rotary position encoding (for rope positional encoding)
+    pub rope: Option<RotaryEmbedding<B>>,
     /// H-level reasoning module
     pub h_level: ReasoningModule<B>,
     /// L-level reasoning module
@@ -221,31 +224,20 @@ impl HierarchicalReasoningModelConfig {
         let embed_tokens = EmbeddingConfig::new(self.vocab_size, self.hidden_size).init(device);
 
         // Position embeddings (if using learned positional encoding)
-        let puzzle_emb_len = if self.puzzle_emb_ndim > 0 {
-            (self.puzzle_emb_ndim + self.hidden_size - 1) / self.hidden_size // ceil division
-        } else {
-            0
-        };
-
         let embed_pos = if self.pos_encodings == "learned" {
-            // Total sequence length includes puzzle tokens
-            let total_seq_len = self.seq_len + puzzle_emb_len;
-            Some(EmbeddingConfig::new(total_seq_len, self.hidden_size).init(device))
+            Some(EmbeddingConfig::new(self.seq_len, self.hidden_size).init(device))
         } else {
             None
         };
 
-        // Puzzle embeddings (sparse, zero-initialized)
-        let puzzle_emb = if self.puzzle_emb_ndim > 0 {
-            // Use a much smaller embedding table - just 1 identifier for blank
-            // Fix: Don't use batch_size here, use actual number of puzzle identifiers
-            let config = SparseEmbeddingConfig::new(
-                self.num_puzzle_identifiers, // Use actual number of identifiers
-                self.puzzle_emb_ndim,
-                self.batch_size, // This is for local weights, not global
+        // Rotary position encoding (if using rope)
+        let rope = if self.pos_encodings == "rope" {
+            let head_dim = self.hidden_size / self.num_heads;
+            Some(
+                RotaryEmbeddingConfig::new(head_dim, self.seq_len)
+                    .with_base(self.rope_theta)
+                    .init(device),
             )
-            .with_init_std(0.0); // Zero initialization for puzzle embeddings
-            Some(config.init(device))
         } else {
             None
         };
@@ -263,22 +255,31 @@ impl HierarchicalReasoningModelConfig {
             .with_bias(true)
             .init(device);
 
-        // Initial states - use normal initialization
+        // NOTE: PyTorch HRM initializes Q-head weights to zero and bias to -5 for faster learning
+        // during bootstrapping. Burn doesn't provide an easy way to customize parameter initialization
+        // after module creation, so we use the default initialization here. This may affect
+        // convergence speed but shouldn't prevent the model from learning.
+
+        // Initial states - use truncated normal initialization to match PyTorch
+        // PyTorch uses trunc_normal_init_ with std=1.0
         let h_init: Tensor<B, 1> = Tensor::random(
             [self.hidden_size],
             burn::tensor::Distribution::Normal(0.0, 1.0),
             device,
-        );
+        )
+        .clamp(-2.0, 2.0); // Truncate to [-2, 2] to approximate trunc_normal
+
         let l_init: Tensor<B, 1> = Tensor::random(
             [self.hidden_size],
             burn::tensor::Distribution::Normal(0.0, 1.0),
             device,
-        );
+        )
+        .clamp(-2.0, 2.0); // Truncate to [-2, 2] to approximate trunc_normal
 
         HierarchicalReasoningModel {
             embed_tokens,
             embed_pos,
-            puzzle_emb,
+            rope,
             h_level,
             l_level,
             lm_head,
@@ -345,63 +346,21 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
         }
     }
 
-    /// Input embedding computation with puzzle embeddings support
+    /// Input embedding computation
     pub fn input_embeddings(&self, input: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        self.input_embeddings_with_puzzle(input, None)
-    }
-
-    /// Input embedding computation with optional puzzle identifiers
-    pub fn input_embeddings_with_puzzle(
-        &self,
-        input: Tensor<B, 2, Int>,
-        puzzle_identifiers: Option<Tensor<B, 1, Int>>,
-    ) -> Tensor<B, 3> {
         // Token embeddings
         let mut embeddings = self.embed_tokens.forward(input);
 
-        // Add puzzle embeddings if present
-        if let (Some(puzzle_emb), Some(puzzle_ids)) = (&self.puzzle_emb, puzzle_identifiers) {
-            let batch_size = embeddings.dims()[0];
-            let hidden_size = embeddings.dims()[2];
+        // Scale embeddings by sqrt(hidden_size) first
+        let embed_scale = (embeddings.dims()[2] as f64).sqrt();
+        embeddings = embeddings * embed_scale;
 
-            // Get puzzle embeddings using actual puzzle_ids (not zeros)
-            let puzzle_embeddings = puzzle_emb.forward(puzzle_ids);
-            let puzzle_emb_dim = puzzle_embeddings.dims()[1];
-
-            // Calculate puzzle_emb_len: -(puzzle_emb_ndim // -hidden_size)
-            let puzzle_emb_len = (puzzle_emb_dim + hidden_size - 1) / hidden_size; // ceil division
-
-            if puzzle_emb_len > 0 && puzzle_emb_dim > 0 {
-                // Pad puzzle embeddings to fit evenly into tokens
-                let target_size = puzzle_emb_len * hidden_size;
-
-                let puzzle_flat = if puzzle_emb_dim < target_size {
-                    let pad_size = target_size - puzzle_emb_dim;
-                    // Pad the last dimension: [batch_size, puzzle_emb_dim] -> [batch_size, target_size]
-                    // For 2D tensor [batch, emb], padding format is (left, right, top, bottom)
-                    // We want to pad the embedding dimension (right side): (0, pad_size, 0, 0)
-                    puzzle_embeddings.pad((0, pad_size, 0, 0), 0.0)
-                } else if puzzle_emb_dim > target_size {
-                    puzzle_embeddings.slice([0..batch_size, 0..target_size])
-                } else {
-                    puzzle_embeddings
-                };
-
-                // Reshape to sequence format [batch, puzzle_emb_len, hidden_size]
-                let puzzle_reshaped =
-                    puzzle_flat.reshape([batch_size, puzzle_emb_len, hidden_size]);
-
-                // Concatenate puzzle embeddings BEFORE token embeddings
-                embeddings = Tensor::cat(vec![puzzle_reshaped, embeddings], 1);
-            }
-        }
-
-        // Position embeddings (if using learned) - applied to FULL sequence including puzzle tokens
+        // Position embeddings (if using learned)
         if let Some(ref embed_pos) = self.embed_pos {
             let seq_len = embeddings.dims()[1];
             let batch_size = embeddings.dims()[0];
 
-            // Create position indices for the full sequence length
+            // Create position indices for the sequence length
             let positions = Tensor::arange(0..seq_len as i64, &embeddings.device())
                 .unsqueeze_dim::<2>(0)
                 .repeat_dim(0, batch_size);
@@ -412,9 +371,7 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
             embeddings = embeddings * 0.707106781 + pos_embeddings * 0.707106781;
         }
 
-        // Scale embeddings by sqrt(hidden_size)
-        let embed_scale = (embeddings.dims()[2] as f64).sqrt();
-        embeddings * embed_scale
+        embeddings
     }
 
     /// Forward pass
@@ -425,20 +382,16 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
         h_cycles: usize,
         l_cycles: usize,
     ) -> (InnerCarry<B>, Tensor<B, 3>, (Tensor<B, 1>, Tensor<B, 1>)) {
-        self.forward_with_puzzle(carry, input, None, h_cycles, l_cycles)
-    }
+        // Input embeddings
+        let input_embeddings = self.input_embeddings(input);
 
-    /// Forward pass with puzzle identifiers
-    pub fn forward_with_puzzle(
-        &self,
-        carry: InnerCarry<B>,
-        input: Tensor<B, 2, Int>,
-        puzzle_identifiers: Option<Tensor<B, 1, Int>>,
-        h_cycles: usize,
-        l_cycles: usize,
-    ) -> (InnerCarry<B>, Tensor<B, 3>, (Tensor<B, 1>, Tensor<B, 1>)) {
-        // Input embeddings with puzzle support
-        let input_embeddings = self.input_embeddings_with_puzzle(input, puzzle_identifiers.clone());
+        // Get RoPE cos/sin if using rope
+        let cos_sin = if let Some(ref rope) = self.rope {
+            let (cos, sin) = rope.forward();
+            Some((cos, sin))
+        } else {
+            None
+        };
 
         // Get current states
         let mut z_h = carry.z_h;
@@ -456,51 +409,30 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
             for _h_step in 0..h_cycles {
                 for _l_step in 0..l_cycles {
                     if !(_h_step == h_cycles - 1 && _l_step == l_cycles - 1) {
-                        z_l = self
-                            .l_level
-                            .forward(z_l, z_h.clone() + input_embeddings.clone());
+                        z_l = self.l_level.forward(
+                            z_l,
+                            z_h.clone() + input_embeddings.clone(),
+                            cos_sin.clone(),
+                        );
                     }
                 }
 
                 if _h_step < h_cycles - 1 {
-                    z_h = self.h_level.forward(z_h, z_l.clone());
+                    z_h = self.h_level.forward(z_h, z_l.clone(), cos_sin.clone());
                 }
             }
         }
 
         // Final step with gradients
-        z_l = self.l_level.forward(z_l, z_h.clone() + input_embeddings);
-        z_h = self.h_level.forward(z_h, z_l.clone());
+        z_l = self
+            .l_level
+            .forward(z_l, z_h.clone() + input_embeddings, cos_sin.clone());
+        z_h = self.h_level.forward(z_h, z_l.clone(), cos_sin);
 
-        // Output predictions (skip puzzle embedding tokens if present)
-        let puzzle_emb_len = if puzzle_identifiers.is_some() {
-            if let Some(puzzle_emb) = &self.puzzle_emb {
-                let puzzle_emb_dim = puzzle_emb.global_weights.dims()[1];
-                let hidden_size = z_h.dims()[2];
-                if puzzle_emb_dim > 0 {
-                    (puzzle_emb_dim + hidden_size - 1) / hidden_size // ceil division
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        // Output predictions
+        let lm_output = self.lm_head.forward(z_h.clone());
 
-        let lm_output = if puzzle_emb_len > 0 {
-            // Skip puzzle embedding tokens in output
-            self.lm_head.forward(z_h.clone().slice([
-                0..z_h.dims()[0],
-                puzzle_emb_len..z_h.dims()[1],
-                0..z_h.dims()[2],
-            ]))
-        } else {
-            self.lm_head.forward(z_h.clone())
-        };
-
-        // Q-values from first token (always position 0, before any puzzle tokens)
+        // Q-values from first token
         let first_token_repr: Tensor<B, 2> = z_h
             .clone()
             .slice([0..z_h.dims()[0], 0..1, 0..z_h.dims()[2]])

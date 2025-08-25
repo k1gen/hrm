@@ -10,14 +10,13 @@ use crate::{
 use burn::{
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::Dataset},
-    nn::loss::CrossEntropyLossConfig,
     optim::AdamConfig,
     prelude::*,
     record::CompactRecorder,
     tensor::backend::AutodiffBackend,
     train::{
         ClassificationOutput, LearnerBuilder, TrainOutput, TrainStep, ValidStep,
-        metric::{AccuracyMetric, CpuMemory, CpuTemperature, CpuUse, LossMetric},
+        metric::{AccuracyMetric, LossMetric},
     },
 };
 
@@ -66,14 +65,14 @@ impl Default for HrmTrainingConfig {
                 batch_size: 32,
                 seq_len: 81,
                 vocab_size: 11,
-                num_puzzle_identifiers: 1,
+
                 hidden_size: 512,
                 num_heads: 8,
                 h_layers: 4,
                 l_layers: 4,
                 h_cycles: 2,
                 l_cycles: 2,
-                puzzle_emb_ndim: 512,
+
                 expansion: 2.666,
                 pos_encodings: "rope".to_string(),
                 rms_norm_eps: 1e-5,
@@ -99,7 +98,6 @@ impl Default for HrmTrainingConfig {
 }
 
 /// Forward pass method for HRM model that returns ClassificationOutput
-
 impl<B: Backend> HierarchicalReasoningModel<B> {
     /// Forward pass for training with loss computation
     pub fn forward_classification(
@@ -120,24 +118,19 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
         );
 
         // Forward pass through the model
-        let (_, logits, _) = self.forward_with_puzzle(
-            carry,
-            batch.inputs.clone(),
-            Some(batch.puzzle_identifiers.clone()),
-            h_cycles,
-            l_cycles,
-        );
+        let (_, logits, _) = self.forward(carry, batch.inputs.clone(), h_cycles, l_cycles);
 
-        // Compute cross-entropy loss
-        let loss_config = CrossEntropyLossConfig::new();
-        let loss_fn = loss_config.init(&logits.device());
+        // Convert targets for cross-entropy loss computation
+        // Original format: empty=1, digits=2-10 (solution has no empty cells, only digits 2-10)
+        // Target classes: digits 1-9 map to classes 0-8
+        let targets_final = batch.targets.clone().add_scalar(-2); // 2->0, 3->1, ..., 10->8
 
-        // Reshape for loss computation: [batch, seq, vocab] -> [batch*seq, vocab]
-        let logits_flat = logits.clone().flatten::<2>(0, 1);
-        let targets_flat = batch.targets.clone().flatten::<1>(0, 1);
+        // Compute PyTorch-style cross-entropy loss
+        let loss = compute_pytorch_cross_entropy_loss(logits.clone(), targets_final.clone());
 
-        // Compute loss (we'll let the accuracy metric handle PAD token ignoring)
-        let loss = loss_fn.forward(logits_flat.clone(), targets_flat.clone());
+        // Reshape for ClassificationOutput compatibility
+        let logits_flat = logits.flatten::<2>(0, 1);
+        let targets_flat = targets_final.flatten::<1>(0, 1);
 
         ClassificationOutput {
             loss,
@@ -145,6 +138,31 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
             targets: targets_flat,
         }
     }
+}
+
+/// Compute cross-entropy loss matching PyTorch HRM implementation
+fn compute_pytorch_cross_entropy_loss<B: Backend>(
+    logits: Tensor<B, 3>,       // [batch, seq, vocab_size]
+    targets: Tensor<B, 2, Int>, // [batch, seq]
+) -> Tensor<B, 1> {
+    let [batch_size, seq_len, _vocab_size] = logits.dims();
+
+    // Flatten for cross-entropy computation
+    let logits_flat = logits.flatten::<2>(0, 1); // [batch*seq, vocab_size]
+    let targets_flat = targets.flatten::<1>(0, 1); // [batch*seq]
+
+    // Compute per-element cross-entropy losses
+    let log_probs = burn::tensor::activation::log_softmax(logits_flat, 1);
+    let targets_expanded = targets_flat.clone().unsqueeze_dim::<2>(1); // [batch*seq, 1]
+    let selected_log_probs = log_probs.gather(1, targets_expanded).squeeze::<1>(1); // [batch*seq]
+    let element_losses = -selected_log_probs; // [batch*seq]
+
+    // Reshape back to [batch, seq]
+    let losses = element_losses.reshape([batch_size, seq_len]);
+
+    // PyTorch HRM computes mean loss per sequence, then sums across sequences
+    let sequence_losses = losses.mean_dim(1); // [batch] - mean loss per sequence
+    sequence_losses.sum() // scalar - sum across all sequences
 }
 
 impl<B: AutodiffBackend> TrainStep<SudokuBatch<B>, ClassificationOutput<B>>
@@ -210,18 +228,12 @@ pub fn train<B: AutodiffBackend>(
     // Initialize model
     let model = config.model.init::<B>(&device);
 
-    // Build learner with TUI metrics
+    // Build learner with basic metrics
     let learner = LearnerBuilder::new(artifact_dir)
-        .metric_train_numeric(AccuracyMetric::new().with_pad_token(0))
-        .metric_valid_numeric(AccuracyMetric::new().with_pad_token(0))
+        .metric_train_numeric(AccuracyMetric::new())
+        .metric_valid_numeric(AccuracyMetric::new())
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
-        .metric_train_numeric(CpuUse::new())
-        .metric_valid_numeric(CpuUse::new())
-        .metric_train_numeric(CpuMemory::new())
-        .metric_valid_numeric(CpuMemory::new())
-        .metric_train_numeric(CpuTemperature::new())
-        .metric_valid_numeric(CpuTemperature::new())
         .with_file_checkpointer(CompactRecorder::new())
         .num_epochs(config.num_epochs)
         .summary()

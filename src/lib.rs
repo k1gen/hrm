@@ -4,6 +4,7 @@
 //! The model supports hierarchical reasoning with two levels (H-level and L-level)
 //! and includes features like adaptive computation time (ACT) and sparse embeddings.
 
+pub mod attention;
 pub mod dataset;
 pub mod model;
 pub mod sparse_embedding;
@@ -15,5 +16,4 @@ pub use dataset::{
     SudokuDatasetMetadata, SudokuItem, create_sudoku_dataset,
 };
 pub use model::{HierarchicalReasoningModel, HierarchicalReasoningModelConfig};
-pub use sparse_embedding::{SparseEmbedding, SparseEmbeddingConfig};
 pub use training::{HrmTrainingConfig, train};

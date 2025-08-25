@@ -320,7 +320,7 @@ dependencies = [
  "bitflags 2.9.3",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2790,6 +2790,7 @@ dependencies = [
  "burn",
  "clap",
  "csv",
+ "nanorand",
  "serde",
 ]
 
@@ -3593,6 +3594,12 @@ dependencies = [
  "thiserror 2.0.16",
  "unicode-ident",
 ]
+
+[[package]]
+name = "nanorand"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
 
 [[package]]
 name = "native-tls"

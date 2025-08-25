@@ -92,9 +92,9 @@ impl<B: Backend> SparseEmbedding<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::ndarray::NdArray;
+    use burn::backend::Wgpu;
 
-    type TestBackend = NdArray;
+    type TestBackend = Wgpu;
 
     #[test]
     fn test_sparse_embedding_creation() {

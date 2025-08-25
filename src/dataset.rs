@@ -15,6 +15,7 @@ pub struct SudokuDatasetConfig {
     pub cache_dir: Option<String>,
     pub subsample_size: Option<usize>,
     pub min_difficulty: Option<u32>,
+    pub num_aug: usize, // Number of augmentations per puzzle
 }
 
 impl Default for SudokuDatasetConfig {
@@ -25,6 +26,7 @@ impl Default for SudokuDatasetConfig {
             cache_dir: None,
             subsample_size: None,
             min_difficulty: None,
+            num_aug: 0,
         }
     }
 }
@@ -49,9 +51,8 @@ pub struct SudokuData {
 /// Training batch for Sudoku puzzles
 #[derive(Debug, Clone)]
 pub struct SudokuBatch<B: Backend> {
-    pub inputs: Tensor<B, 2, Int>,             // [batch_size, 81]
-    pub targets: Tensor<B, 2, Int>,            // [batch_size, 81]
-    pub puzzle_identifiers: Tensor<B, 1, Int>, // [batch_size] - all zeros for blank identifier
+    pub inputs: Tensor<B, 2, Int>,  // [batch_size, 81]
+    pub targets: Tensor<B, 2, Int>, // [batch_size, 81]
 }
 
 /// Simple dataset wrapper for Sudoku data
@@ -111,12 +112,10 @@ impl<B: Backend> Batcher<B, SudokuData, SudokuBatch<B>> for SudokuBatcher<B> {
         // Collect data from all items
         let mut inputs_data = Vec::with_capacity(batch_size * seq_len);
         let mut targets_data = Vec::with_capacity(batch_size * seq_len);
-        let mut puzzle_ids = Vec::with_capacity(batch_size);
 
         for item in items {
             inputs_data.extend(item.input.iter().map(|&x| x as i32));
             targets_data.extend(item.target.iter().map(|&x| x as i32));
-            puzzle_ids.push(0i32); // All puzzles use blank identifier (0)
         }
 
         // Create tensors
@@ -124,13 +123,8 @@ impl<B: Backend> Batcher<B, SudokuData, SudokuBatch<B>> for SudokuBatcher<B> {
             .reshape([batch_size, seq_len]);
         let targets = Tensor::<B, 1, Int>::from_ints(targets_data.as_slice(), device)
             .reshape([batch_size, seq_len]);
-        let puzzle_identifiers = Tensor::<B, 1, Int>::from_ints(puzzle_ids.as_slice(), device);
 
-        SudokuBatch {
-            inputs,
-            targets,
-            puzzle_identifiers,
-        }
+        SudokuBatch { inputs, targets }
     }
 }
 
@@ -162,17 +156,14 @@ fn download_csv_with_cache(
     );
 
     // Check if cached file exists and is recent (less than 1 day old)
-    if let Ok(metadata) = fs::metadata(&cache_file) {
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(elapsed) = modified.elapsed() {
-                if elapsed.as_secs() < 86400 {
+    if let Ok(metadata) = fs::metadata(&cache_file)
+        && let Ok(modified) = metadata.modified()
+            && let Ok(elapsed) = modified.elapsed()
+                && elapsed.as_secs() < 86400 {
                     // 1 day
                     println!("Using cached {} data from {}", split, cache_file);
                     return Ok(fs::read_to_string(&cache_file)?);
                 }
-            }
-        }
-    }
 
     // Download if not cached or cache is old
     let url = format!(
@@ -229,11 +220,10 @@ fn process_csv_data(
         let rating: u32 = record[3].parse().unwrap_or(0);
 
         // Apply difficulty filter if specified
-        if let Some(min_diff) = config.min_difficulty {
-            if rating < min_diff {
+        if let Some(min_diff) = config.min_difficulty
+            && rating < min_diff {
                 continue;
             }
-        }
 
         // Validate puzzle and solution length
         if puzzle.len() != 81 || solution.len() != 81 {
@@ -250,18 +240,195 @@ fn process_csv_data(
             puzzle_id: index,
         });
 
-        // Apply subsample limit if specified for training
-        if config.split == "train" {
-            if let Some(subsample_size) = config.subsample_size {
-                if items.len() >= subsample_size {
-                    break;
-                }
+        // Apply subsample limit if specified
+        if let Some(subsample_size) = config.subsample_size
+            && items.len() >= subsample_size {
+                break;
+            }
+    }
+
+    println!("Processed {} puzzles from CSV", items.len());
+    // Apply augmentation for training data
+    if config.split == "train" && config.num_aug > 0 {
+        let original_items = items.clone();
+        for original_item in original_items {
+            for aug_id in 1..=config.num_aug {
+                let (aug_input, aug_target) =
+                    apply_sudoku_augmentation(&original_item.input, &original_item.target, aug_id);
+                items.push(SudokuData {
+                    input: aug_input,
+                    target: aug_target,
+                    puzzle_id: original_item.puzzle_id * 1000 + aug_id, // Unique ID for augmented puzzles
+                });
             }
         }
     }
 
-    println!("Processed {} puzzles from CSV", items.len());
+    println!(
+        "Processed {} puzzles from CSV (including {} augmentations)",
+        items.len(),
+        if config.split == "train" {
+            config.num_aug
+        } else {
+            0
+        }
+    );
     Ok(items)
+}
+
+/// Apply PyTorch-style Sudoku augmentation with digit permutation and advanced position mapping
+fn apply_sudoku_augmentation(input: &[u8], target: &[u8], aug_id: usize) -> (Vec<u8>, Vec<u8>) {
+    use nanorand::WyRand;
+
+    // Use aug_id as seed for reproducible augmentations
+    let mut rng = WyRand::new_seed(aug_id as u64);
+
+    // Convert input back to 0-9 range (subtract 1 since our data is 1-10)
+    let mut input_grid: [[u8; 9]; 9] = [[0; 9]; 9];
+    let mut target_grid: [[u8; 9]; 9] = [[0; 9]; 9];
+
+    for i in 0..9 {
+        for j in 0..9 {
+            input_grid[i][j] = input[i * 9 + j].saturating_sub(1);
+            target_grid[i][j] = target[i * 9 + j].saturating_sub(1);
+        }
+    }
+
+    // Apply PyTorch-style shuffle_sudoku transformation
+    let (aug_input_grid, aug_target_grid) = shuffle_sudoku_rust(input_grid, target_grid, &mut rng);
+
+    // Convert back to flat arrays with +1 offset
+    let mut aug_input = vec![0u8; 81];
+    let mut aug_target = vec![0u8; 81];
+
+    for i in 0..9 {
+        for j in 0..9 {
+            aug_input[i * 9 + j] = aug_input_grid[i][j] + 1;
+            aug_target[i * 9 + j] = aug_target_grid[i][j] + 1;
+        }
+    }
+
+    (aug_input, aug_target)
+}
+
+/// Rust implementation of PyTorch's shuffle_sudoku function
+fn shuffle_sudoku_rust(
+    input_board: [[u8; 9]; 9],
+    target_board: [[u8; 9]; 9],
+    rng: &mut nanorand::WyRand,
+) -> ([[u8; 9]; 9], [[u8; 9]; 9]) {
+    use nanorand::Rng;
+    // Create a random digit mapping: a permutation of 1..9, with zero (blank) unchanged
+    let mut digits: Vec<u8> = (1..=9).collect();
+    shuffle_vec(&mut digits, rng);
+    let mut digit_map = [0u8; 10]; // digit_map[0] = 0 (blank stays blank)
+    for (i, &digit) in digits.iter().enumerate() {
+        digit_map[i + 1] = digit;
+    }
+
+    // Randomly decide whether to transpose
+    let transpose_flag = rng.generate::<f32>() < 0.5;
+
+    // Generate valid row permutation: shuffle 3 bands, then shuffle rows within each band
+    let mut bands: Vec<usize> = (0..3).collect();
+    shuffle_vec(&mut bands, rng);
+
+    let mut row_perm = Vec::with_capacity(9);
+    for &band in &bands {
+        let mut band_rows: Vec<usize> = (0..3).map(|i| band * 3 + i).collect();
+        shuffle_vec(&mut band_rows, rng);
+        row_perm.extend(band_rows);
+    }
+
+    // Similarly for columns (stacks)
+    let mut stacks: Vec<usize> = (0..3).collect();
+    shuffle_vec(&mut stacks, rng);
+
+    let mut col_perm = Vec::with_capacity(9);
+    for &stack in &stacks {
+        let mut stack_cols: Vec<usize> = (0..3).map(|i| stack * 3 + i).collect();
+        shuffle_vec(&mut stack_cols, rng);
+        col_perm.extend(stack_cols);
+    }
+
+    // Build 81->81 mapping
+    let mut mapping = [0usize; 81];
+    for i in 0..81 {
+        let old_row = row_perm[i / 9];
+        let old_col = col_perm[i % 9];
+        mapping[i] = old_row * 9 + old_col;
+    }
+
+    // Apply transformation to both boards
+    let apply_transformation = |board: [[u8; 9]; 9]| -> [[u8; 9]; 9] {
+        let mut result = board;
+
+        // Apply transpose if flag is set
+        if transpose_flag {
+            let mut transposed = [[0u8; 9]; 9];
+            for i in 0..9 {
+                for j in 0..9 {
+                    transposed[j][i] = result[i][j];
+                }
+            }
+            result = transposed;
+        }
+
+        // Apply position mapping
+        let flat: Vec<u8> = result.iter().flatten().copied().collect();
+        let mut new_flat = [0u8; 81];
+        for i in 0..81 {
+            new_flat[i] = flat[mapping[i]];
+        }
+
+        // Reshape back to 9x9
+        let mut new_board = [[0u8; 9]; 9];
+        for i in 0..9 {
+            for j in 0..9 {
+                new_board[i][j] = new_flat[i * 9 + j];
+            }
+        }
+
+        // Apply digit mapping
+        for i in 0..9 {
+            for j in 0..9 {
+                new_board[i][j] = digit_map[new_board[i][j] as usize];
+            }
+        }
+
+        new_board
+    };
+
+    (
+        apply_transformation(input_board),
+        apply_transformation(target_board),
+    )
+}
+
+/// Simple Fisher-Yates shuffle for nanorand
+fn shuffle_vec<T>(slice: &mut [T], rng: &mut nanorand::WyRand) {
+    use nanorand::Rng;
+    for i in (1..slice.len()).rev() {
+        let j = rng.generate_range(0..=i);
+        slice.swap(i, j);
+    }
+}
+
+/// Print the processed data statistics
+#[allow(dead_code)]
+fn print_data_stats(items: &[SudokuData], config: &SudokuDatasetConfig) {
+    let original_count = if config.split == "train" && config.num_aug > 0 {
+        items.len() / (config.num_aug + 1)
+    } else {
+        items.len()
+    };
+
+    println!("Dataset statistics for {}:", config.split);
+    println!("  - Original puzzles: {}", original_count);
+    if config.split == "train" && config.num_aug > 0 {
+        println!("  - Augmentations per puzzle: {}", config.num_aug);
+        println!("  - Total training examples: {}", items.len());
+    }
 }
 
 /// Parse a Sudoku string (81 characters) into a vector of u8
@@ -282,23 +449,15 @@ fn parse_sudoku_string(s: &str) -> Vec<u8> {
 /// Dataset metadata for Sudoku puzzles
 #[derive(Debug, Clone)]
 pub struct SudokuDatasetMetadata {
-    pub vocab_size: usize,              // 11 (PAD(0) + empty(1) + digits(2-10))
-    pub seq_len: usize,                 // 81 (9x9 grid)
-    pub num_puzzle_identifiers: usize,  // 1 (just blank identifier)
-    pub pad_id: usize,                  // 0
-    pub ignore_label_id: Option<usize>, // Some(1) for empty cells in loss computation
-    pub blank_identifier_id: usize,     // 0
+    pub vocab_size: usize, // 9 (digits 0-8, representing Sudoku digits 1-9)
+    pub seq_len: usize,    // 81 (9x9 grid)
 }
 
 impl Default for SudokuDatasetMetadata {
     fn default() -> Self {
         Self {
-            vocab_size: 11, // PAD(0) + empty(1) + digits(2-10)
-            seq_len: 81,    // 9x9 grid
-            num_puzzle_identifiers: 1,
-            pad_id: 0,
-            ignore_label_id: Some(1), // Ignore empty cells in loss
-            blank_identifier_id: 0,
+            vocab_size: 9, // Digits 1-9 (classes 0-8) - no pad token needed
+            seq_len: 81,   // 9x9 grid
         }
     }
 }
