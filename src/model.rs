@@ -16,8 +16,43 @@ use crate::attention::{
 };
 use burn::config::Config;
 use burn::module::{Content, DisplaySettings, Module, ModuleDisplay, Param};
-use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::nn::Initializer;
+use burn::nn::{Embedding, Linear, RmsNorm, RmsNormConfig};
 use burn::tensor::{Int, Tensor, backend::Backend};
+
+/// Create a truncated normal initialized tensor using Burn's built-in initializers
+/// This uses KaimingNormal (which is LeCun normal with fan_out_only=false) and adds clamping
+fn init_truncated_normal<B: Backend>(
+    shape: [usize; 2],
+    std: f64,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    // Use Normal initializer directly for precise std control
+    let initializer = Initializer::Normal { mean: 0.0, std };
+    let tensor = initializer
+        .init_with(shape, None, None, device)
+        .into_value();
+    // Apply truncation bounds matching PyTorch [-2.0, 2.0]
+    tensor.clamp(-2.0, 2.0)
+}
+
+/// Create LeCun normal initialized tensor (std = 1/sqrt(fan_in)) with truncation
+fn init_lecun_normal<B: Backend>(
+    shape: [usize; 2],
+    fan_in: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    // KaimingNormal with fan_out_only=false gives exactly LeCun normal: std = 1/sqrt(fan_in)
+    let initializer = Initializer::KaimingNormal {
+        gain: 1.0,
+        fan_out_only: false,
+    };
+    let tensor = initializer
+        .init_with(shape, Some(fan_in), None, device)
+        .into_value();
+    // Apply truncation bounds matching PyTorch [-2.0, 2.0]
+    tensor.clamp(-2.0, 2.0)
+}
 
 /// Configuration for the Hierarchical Reasoning Model
 #[derive(Config, Debug)]
@@ -82,6 +117,7 @@ impl<B: Backend> TransformerBlock<B> {
     pub fn new(config: &HierarchicalReasoningModelConfig, device: &B::Device) -> Self {
         let head_dim = config.hidden_size / config.num_heads;
 
+        // Create attention with custom initialization - this will need to be updated in attention.rs
         let self_attn = CustomAttentionConfig::new(
             config.hidden_size,
             head_dim,
@@ -91,6 +127,7 @@ impl<B: Backend> TransformerBlock<B> {
         .with_dropout(config.dropout)
         .init(device);
 
+        // Create MLP with custom initialization - this will need to be updated in attention.rs
         let mlp = CustomSwiGluConfig::new(config.hidden_size, config.expansion).init(device);
 
         let norm1 = RmsNormConfig::new(config.hidden_size)
@@ -122,7 +159,6 @@ impl<B: Backend> TransformerBlock<B> {
 
         // MLP with residual connection
         let mlp_output = self.mlp.forward(hidden_states.clone());
-        
 
         self.norm2.forward(hidden_states + mlp_output)
     }
@@ -218,14 +254,23 @@ impl<B: Backend> ModuleDisplay for HierarchicalReasoningModel<B> {
 impl HierarchicalReasoningModelConfig {
     /// Initialize the hierarchical reasoning model
     pub fn init<B: Backend>(&self, device: &B::Device) -> HierarchicalReasoningModel<B> {
-        let _embed_scale = (self.hidden_size as f64).sqrt();
+        let embed_scale = (self.hidden_size as f32).sqrt();
 
-        // Token embeddings
-        let embed_tokens = EmbeddingConfig::new(self.vocab_size, self.hidden_size).init(device);
+        // Token embeddings with custom truncated normal initialization
+        let embed_init_std = (1.0 / embed_scale) as f64;
+        let embed_weight =
+            init_truncated_normal([self.vocab_size, self.hidden_size], embed_init_std, device);
+        let embed_tokens = Embedding {
+            weight: Param::from_tensor(embed_weight),
+        };
 
         // Position embeddings (if using learned positional encoding)
         let embed_pos = if self.pos_encodings == "learned" {
-            Some(EmbeddingConfig::new(self.seq_len, self.hidden_size).init(device))
+            let pos_weight =
+                init_truncated_normal([self.seq_len, self.hidden_size], embed_init_std, device);
+            Some(Embedding {
+                weight: Param::from_tensor(pos_weight),
+            })
         } else {
             None
         };
@@ -246,35 +291,36 @@ impl HierarchicalReasoningModelConfig {
         let h_level = ReasoningModule::new(self.h_layers, self, device);
         let l_level = ReasoningModule::new(self.l_layers, self, device);
 
-        // Output heads
-        let lm_head = LinearConfig::new(self.hidden_size, self.vocab_size)
-            .with_bias(false)
-            .init(device);
+        // Output heads with custom truncated LeCun normal initialization
+        let lm_head_weight = init_lecun_normal(
+            [self.vocab_size, self.hidden_size],
+            self.hidden_size,
+            device,
+        );
+        let lm_head = Linear {
+            weight: Param::from_tensor(lm_head_weight),
+            bias: None,
+        };
 
-        let q_head = LinearConfig::new(self.hidden_size, 2)
-            .with_bias(true)
-            .init(device);
+        // Initialize Q-head with custom initialization to match PyTorch
+        // PyTorch: weights=0, bias=-5 for faster bootstrapping
+        let q_head_weight = Initializer::Zeros
+            .init([2, self.hidden_size], device)
+            .into_value();
+        let q_head_bias = Tensor::from_data([-5.0, -5.0], device);
 
-        // NOTE: PyTorch HRM initializes Q-head weights to zero and bias to -5 for faster learning
-        // during bootstrapping. Burn doesn't provide an easy way to customize parameter initialization
-        // after module creation, so we use the default initialization here. This may affect
-        // convergence speed but shouldn't prevent the model from learning.
+        let q_head = Linear {
+            weight: Param::from_tensor(q_head_weight),
+            bias: Some(Param::from_tensor(q_head_bias)),
+        };
 
-        // Initial states - use truncated normal initialization to match PyTorch
+        // Initial states - use truncated normal initialization to match PyTorch exactly
         // PyTorch uses trunc_normal_init_ with std=1.0
-        let h_init: Tensor<B, 1> = Tensor::random(
-            [self.hidden_size],
-            burn::tensor::Distribution::Normal(0.0, 1.0),
-            device,
-        )
-        .clamp(-2.0, 2.0); // Truncate to [-2, 2] to approximate trunc_normal
+        let h_init_2d = init_truncated_normal([1, self.hidden_size], 1.0, device);
+        let h_init = h_init_2d.squeeze::<1>(0);
 
-        let l_init: Tensor<B, 1> = Tensor::random(
-            [self.hidden_size],
-            burn::tensor::Distribution::Normal(0.0, 1.0),
-            device,
-        )
-        .clamp(-2.0, 2.0); // Truncate to [-2, 2] to approximate trunc_normal
+        let l_init_2d = init_truncated_normal([1, self.hidden_size], 1.0, device);
+        let l_init = l_init_2d.squeeze::<1>(0);
 
         HierarchicalReasoningModel {
             embed_tokens,

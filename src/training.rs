@@ -64,7 +64,7 @@ impl Default for HrmTrainingConfig {
             model: HierarchicalReasoningModelConfig {
                 batch_size: 32,
                 seq_len: 81,
-                vocab_size: 11,
+                vocab_size: 11, // PAD + digits 0-9 to match PyTorch
 
                 hidden_size: 512,
                 num_heads: 8,
@@ -120,10 +120,9 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
         // Forward pass through the model
         let (_, logits, _) = self.forward(carry, batch.inputs.clone(), h_cycles, l_cycles);
 
-        // Convert targets for cross-entropy loss computation
-        // Original format: empty=1, digits=2-10 (solution has no empty cells, only digits 2-10)
-        // Target classes: digits 1-9 map to classes 0-8
-        let targets_final = batch.targets.clone().add_scalar(-2); // 2->0, 3->1, ..., 10->8
+        // Keep targets in original format: empty=1, digits=2-10 (matching PyTorch implementation)
+        // With vocab_size=11, model predicts classes 0-10, so targets 1-10 are valid
+        let targets_final = batch.targets.clone(); // Keep original 1-10 encoding
 
         // Compute PyTorch-style cross-entropy loss
         let loss = compute_pytorch_cross_entropy_loss(logits.clone(), targets_final.clone());
@@ -140,29 +139,30 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
     }
 }
 
-/// Compute cross-entropy loss matching PyTorch HRM implementation
+/// Compute cross-entropy loss matching PyTorch HRM implementation exactly
 fn compute_pytorch_cross_entropy_loss<B: Backend>(
     logits: Tensor<B, 3>,       // [batch, seq, vocab_size]
     targets: Tensor<B, 2, Int>, // [batch, seq]
 ) -> Tensor<B, 1> {
     let [batch_size, seq_len, _vocab_size] = logits.dims();
 
-    // Flatten for cross-entropy computation
+    // Flatten for cross-entropy computation - matches PyTorch F.cross_entropy
     let logits_flat = logits.flatten::<2>(0, 1); // [batch*seq, vocab_size]
     let targets_flat = targets.flatten::<1>(0, 1); // [batch*seq]
 
-    // Compute per-element cross-entropy losses
+    // Compute per-element cross-entropy losses (reduction="none")
     let log_probs = burn::tensor::activation::log_softmax(logits_flat, 1);
     let targets_expanded = targets_flat.clone().unsqueeze_dim::<2>(1); // [batch*seq, 1]
     let selected_log_probs = log_probs.gather(1, targets_expanded).squeeze::<1>(1); // [batch*seq]
     let element_losses = -selected_log_probs; // [batch*seq]
 
-    // Reshape back to [batch, seq]
+    // Reshape back to [batch, seq] for per-sequence processing
     let losses = element_losses.reshape([batch_size, seq_len]);
 
-    // PyTorch HRM computes mean loss per sequence, then sums across sequences
-    let sequence_losses = losses.mean_dim(1); // [batch] - mean loss per sequence
-    sequence_losses.sum() // scalar - sum across all sequences
+    // PyTorch: (element_losses / loss_divisor).sum() where loss_divisor = seq_len per sequence
+    // This means: for each sequence, divide all its losses by seq_len, then sum across all elements
+    let sequence_normalized_losses = losses / (seq_len as f32); // [batch, seq] / scalar
+    sequence_normalized_losses.sum() // Sum across all batch and sequence dimensions
 }
 
 impl<B: AutodiffBackend> TrainStep<SudokuBatch<B>, ClassificationOutput<B>>

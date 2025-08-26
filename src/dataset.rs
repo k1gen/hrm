@@ -158,12 +158,13 @@ fn download_csv_with_cache(
     // Check if cached file exists and is recent (less than 1 day old)
     if let Ok(metadata) = fs::metadata(&cache_file)
         && let Ok(modified) = metadata.modified()
-            && let Ok(elapsed) = modified.elapsed()
-                && elapsed.as_secs() < 86400 {
-                    // 1 day
-                    println!("Using cached {} data from {}", split, cache_file);
-                    return Ok(fs::read_to_string(&cache_file)?);
-                }
+        && let Ok(elapsed) = modified.elapsed()
+        && elapsed.as_secs() < 86400
+    {
+        // 1 day
+        println!("Using cached {} data from {}", split, cache_file);
+        return Ok(fs::read_to_string(&cache_file)?);
+    }
 
     // Download if not cached or cache is old
     let url = format!(
@@ -221,9 +222,10 @@ fn process_csv_data(
 
         // Apply difficulty filter if specified
         if let Some(min_diff) = config.min_difficulty
-            && rating < min_diff {
-                continue;
-            }
+            && rating < min_diff
+        {
+            continue;
+        }
 
         // Validate puzzle and solution length
         if puzzle.len() != 81 || solution.len() != 81 {
@@ -242,9 +244,10 @@ fn process_csv_data(
 
         // Apply subsample limit if specified
         if let Some(subsample_size) = config.subsample_size
-            && items.len() >= subsample_size {
-                break;
-            }
+            && items.len() >= subsample_size
+        {
+            break;
+        }
     }
 
     println!("Processed {} puzzles from CSV", items.len());
@@ -449,15 +452,15 @@ fn parse_sudoku_string(s: &str) -> Vec<u8> {
 /// Dataset metadata for Sudoku puzzles
 #[derive(Debug, Clone)]
 pub struct SudokuDatasetMetadata {
-    pub vocab_size: usize, // 9 (digits 0-8, representing Sudoku digits 1-9)
+    pub vocab_size: usize, // 11 (PAD + digits 0-9 to match PyTorch)
     pub seq_len: usize,    // 81 (9x9 grid)
 }
 
 impl Default for SudokuDatasetMetadata {
     fn default() -> Self {
         Self {
-            vocab_size: 9, // Digits 1-9 (classes 0-8) - no pad token needed
-            seq_len: 81,   // 9x9 grid
+            vocab_size: 11, // PAD + digits 0-9 to match PyTorch
+            seq_len: 81,    // 9x9 grid
         }
     }
 }

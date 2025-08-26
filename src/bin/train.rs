@@ -124,8 +124,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create model configuration
     let model_config = HierarchicalReasoningModelConfig {
         batch_size: args.batch_size,
-        seq_len: 81,   // 9x9 Sudoku grid
-        vocab_size: 9, // Digits 1-9 (classes 0-8) - no pad token needed
+        seq_len: 81,    // 9x9 Sudoku grid
+        vocab_size: 11, // PAD + digits 0-9 to match PyTorch implementation
         hidden_size: args.hidden_size,
         num_heads: args.num_heads,
         h_layers: args.h_layers,

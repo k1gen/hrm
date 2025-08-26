@@ -6,9 +6,27 @@
 
 use burn::config::Config;
 use burn::module::{Content, DisplaySettings, Module, ModuleDisplay, Param};
-use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig};
+use burn::nn::{Dropout, DropoutConfig, Initializer, Linear};
 
 use burn::tensor::{Tensor, activation, backend::Backend};
+
+/// Create LeCun normal initialized tensor (std = 1/sqrt(fan_in)) with truncation
+fn init_lecun_normal<B: Backend>(
+    shape: [usize; 2],
+    fan_in: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    // KaimingNormal with fan_out_only=false gives exactly LeCun normal: std = 1/sqrt(fan_in)
+    let initializer = Initializer::KaimingNormal {
+        gain: 1.0,
+        fan_out_only: false,
+    };
+    let tensor = initializer
+        .init_with(shape, Some(fan_in), None, device)
+        .into_value();
+    // Apply truncation bounds matching PyTorch [-2.0, 2.0]
+    tensor.clamp(-2.0, 2.0)
+}
 
 /// Configuration for custom multi-head attention with RoPE
 #[derive(Config, Debug)]
@@ -173,16 +191,20 @@ impl CustomAttentionConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CustomAttention<B> {
         let output_size = self.head_dim * self.num_heads;
 
-        // Combined QKV projection
+        // Combined QKV projection with LeCun normal initialization
         let qkv_size = (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim;
-        let qkv_proj = LinearConfig::new(self.hidden_size, qkv_size)
-            .with_bias(false)
-            .init(device);
+        let qkv_weight = init_lecun_normal([qkv_size, self.hidden_size], self.hidden_size, device);
+        let qkv_proj = Linear {
+            weight: Param::from_tensor(qkv_weight),
+            bias: None,
+        };
 
-        // Output projection
-        let o_proj = LinearConfig::new(output_size, self.hidden_size)
-            .with_bias(false)
-            .init(device);
+        // Output projection with LeCun normal initialization
+        let o_weight = init_lecun_normal([self.hidden_size, output_size], output_size, device);
+        let o_proj = Linear {
+            weight: Param::from_tensor(o_weight),
+            bias: None,
+        };
 
         let dropout = DropoutConfig::new(self.dropout).init();
 
@@ -350,15 +372,27 @@ impl CustomSwiGluConfig {
             (self.expansion * self.hidden_size as f64 * 2.0 / 3.0).round() as usize;
         let intermediate_size = base_intermediate.div_ceil(256) * 256; // Round up to multiple of 256
 
-        // Gate and up projection combined
-        let gate_up_proj = LinearConfig::new(self.hidden_size, intermediate_size * 2)
-            .with_bias(false)
-            .init(device);
+        // Gate and up projection combined with LeCun normal initialization
+        let gate_up_weight = init_lecun_normal(
+            [intermediate_size * 2, self.hidden_size],
+            self.hidden_size,
+            device,
+        );
+        let gate_up_proj = Linear {
+            weight: Param::from_tensor(gate_up_weight),
+            bias: None,
+        };
 
-        // Down projection
-        let down_proj = LinearConfig::new(intermediate_size, self.hidden_size)
-            .with_bias(false)
-            .init(device);
+        // Down projection with LeCun normal initialization
+        let down_weight = init_lecun_normal(
+            [self.hidden_size, intermediate_size],
+            intermediate_size,
+            device,
+        );
+        let down_proj = Linear {
+            weight: Param::from_tensor(down_weight),
+            bias: None,
+        };
 
         CustomSwiGlu {
             gate_up_proj,
