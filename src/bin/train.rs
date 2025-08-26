@@ -60,6 +60,10 @@ struct Args {
     /// Number of data augmentations per training puzzle
     #[arg(long, default_value = "4")]
     num_aug: usize,
+
+    /// Force restart training from scratch (ignore checkpoints)
+    #[arg(long, default_value = "false")]
+    force_restart: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -67,11 +71,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("🚀 Starting HRM Sudoku training");
     println!("📁 Output directory: {:?}", args.output_dir);
+
+    // Handle force restart option
+    if args.force_restart {
+        println!("🧹 Force restart enabled - removing existing checkpoints...");
+        let checkpoint_dir = args.output_dir.join("checkpoint");
+        if checkpoint_dir.exists() {
+            std::fs::remove_dir_all(&checkpoint_dir)?;
+        }
+    }
+
     println!("⚙️  Configuration:");
     println!("   - Epochs: {}", args.epochs);
     println!("   - Batch size: {}", args.batch_size);
     println!("   - Learning rate: {}", args.learning_rate);
     println!("   - Hidden size: {}", args.hidden_size);
+    println!("   - Force restart: {}", args.force_restart);
 
     let device = burn::backend::wgpu::WgpuDevice::default();
     println!("🔧 Using device: {:?}", device);

@@ -184,10 +184,37 @@ impl<B: Backend> ValidStep<SudokuBatch<B>, ClassificationOutput<B>>
     }
 }
 
-/// Create artifact directory for training outputs
+/// Create artifact directory for training outputs (only if it doesn't exist)
 fn create_artifact_dir(artifact_dir: &str) {
-    std::fs::remove_dir_all(artifact_dir).ok();
     std::fs::create_dir_all(artifact_dir).ok();
+}
+
+/// Check if checkpoints exist and return the latest checkpoint epoch
+fn find_latest_checkpoint(artifact_dir: &str) -> Option<usize> {
+    let checkpoint_dir = format!("{}/checkpoint", artifact_dir);
+    if !std::path::Path::new(&checkpoint_dir).exists() {
+        return None;
+    }
+
+    let mut latest_epoch = None;
+    if let Ok(entries) = std::fs::read_dir(&checkpoint_dir) {
+        for entry in entries.flatten() {
+            if let Some(filename) = entry.file_name().to_str() {
+                if filename.starts_with("model-") && filename.ends_with(".mpk") {
+                    if let Some(epoch_str) = filename
+                        .strip_prefix("model-")
+                        .and_then(|s| s.strip_suffix(".mpk"))
+                    {
+                        if let Ok(epoch) = epoch_str.parse::<usize>() {
+                            latest_epoch =
+                                Some(latest_epoch.map_or(epoch, |prev: usize| prev.max(epoch)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    latest_epoch
 }
 
 /// Main training function with TUI support
@@ -200,10 +227,22 @@ pub fn train<B: AutodiffBackend>(
 ) {
     create_artifact_dir(artifact_dir);
 
-    // Save configuration
-    config
-        .save(format!("{artifact_dir}/config.json"))
-        .expect("Config should be saved successfully");
+    // Check if we can resume from checkpoint
+    let latest_checkpoint = find_latest_checkpoint(artifact_dir);
+
+    if let Some(epoch) = latest_checkpoint {
+        println!(
+            "🔄 Found existing checkpoint at epoch {}. Resuming training...",
+            epoch
+        );
+    } else {
+        println!("🆕 No existing checkpoints found. Starting fresh training...");
+
+        // Save configuration only when starting fresh
+        config
+            .save(format!("{artifact_dir}/config.json"))
+            .expect("Config should be saved successfully");
+    }
 
     // Set random seed
     B::seed(config.seed);
@@ -229,7 +268,7 @@ pub fn train<B: AutodiffBackend>(
     let model = config.model.init::<B>(&device);
 
     // Build learner with basic metrics
-    let learner = LearnerBuilder::new(artifact_dir)
+    let learner_builder = LearnerBuilder::new(artifact_dir)
         .metric_train_numeric(AccuracyMetric::new())
         .metric_valid_numeric(AccuracyMetric::new())
         .metric_train_numeric(LossMetric::new())
@@ -237,8 +276,18 @@ pub fn train<B: AutodiffBackend>(
         .with_file_checkpointer(CompactRecorder::new())
         .num_epochs(config.num_epochs)
         .summary()
-        .learning_strategy(burn::train::LearningStrategy::SingleDevice(device.clone()))
-        .build(model, config.optimizer.init(), config.learning_rate);
+        .learning_strategy(burn::train::LearningStrategy::SingleDevice(device.clone()));
+
+    // Either resume from checkpoint or start fresh
+    let learner = if let Some(checkpoint_epoch) = latest_checkpoint {
+        learner_builder.checkpoint(checkpoint_epoch).build(
+            model,
+            config.optimizer.init(),
+            config.learning_rate,
+        )
+    } else {
+        learner_builder.build(model, config.optimizer.init(), config.learning_rate)
+    };
 
     // Start training (TUI will automatically be used if available)
     let model_trained = learner.fit(dataloader_train, dataloader_val);
