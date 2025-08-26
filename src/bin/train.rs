@@ -5,10 +5,7 @@
 
 use burn::backend::{Autodiff, Wgpu};
 use clap::Parser;
-use hrm::{
-    HierarchicalReasoningModelConfig, HrmTrainingConfig, SudokuDatasetConfig,
-    create_sudoku_dataset, train,
-};
+use hrm::{HrmTrainingConfig, SudokuDatasetConfig, create_sudoku_dataset, train};
 use std::path::PathBuf;
 
 type MyBackend = Wgpu<f32, i32>;
@@ -111,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ..train_config.clone()
     };
 
-    // Load datasets directly with CSV download
+    // Load datasets
     println!("📥 Loading training dataset...");
     let train_dataset = create_sudoku_dataset(train_config)?;
     println!("📥 Loading test dataset...");
@@ -121,29 +118,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("   - Training samples: {}", train_dataset.len());
     println!("   - Test samples: {}", test_dataset.len());
 
-    // Create model configuration
-    let model_config = HierarchicalReasoningModelConfig {
-        batch_size: args.batch_size,
-        seq_len: 81,    // 9x9 Sudoku grid
-        vocab_size: 11, // PAD + digits 0-9 to match PyTorch implementation
-        hidden_size: args.hidden_size,
-        num_heads: args.num_heads,
-        h_layers: args.h_layers,
-        l_layers: args.l_layers,
-        h_cycles: 2,
-        l_cycles: 2,
-        expansion: 2.666,
-        pos_encodings: "rope".to_string(),
-        rms_norm_eps: 1e-5,
-        rope_theta: 10000.0,
-        dropout: 0.1,
-        halt_max_steps: 8,
-        halt_exploration_prob: 0.1,
-    };
-
     // Create training configuration
     let training_config = HrmTrainingConfig {
-        model: model_config,
+        model: hrm::HierarchicalReasoningModelConfig {
+            batch_size: args.batch_size,
+            seq_len: 81,    // 9x9 Sudoku grid
+            vocab_size: 11, // PAD + digits 0-9
+            hidden_size: args.hidden_size,
+            num_heads: args.num_heads,
+            h_layers: args.h_layers,
+            l_layers: args.l_layers,
+            h_cycles: 2,
+            l_cycles: 2,
+            expansion: 2.666,
+            pos_encodings: "rope".to_string(),
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dropout: 0.1,
+            halt_max_steps: 8,
+            halt_exploration_prob: 0.1,
+        },
         optimizer: burn::optim::AdamConfig::new()
             .with_weight_decay(Some(burn::optim::decay::WeightDecayConfig::new(1.0)))
             .with_epsilon(1e-8)
@@ -163,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("🎯 Starting training with TUI...");
 
-    // Start training (TUI will be automatically enabled)
+    // Start training
     train::<MyAutodiffBackend>(
         &args.output_dir.to_string_lossy(),
         training_config,

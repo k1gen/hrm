@@ -21,11 +21,17 @@ fn init_lecun_normal<B: Backend>(
         gain: 1.0,
         fan_out_only: false,
     };
-    let tensor = initializer
+    let tensor: Tensor<B, 2> = initializer
         .init_with(shape, Some(fan_in), None, device)
         .into_value();
-    // Apply truncation bounds matching PyTorch [-2.0, 2.0]
-    tensor.clamp(-2.0, 2.0)
+    // Extract data, apply truncation in-place, and create new leaf tensor
+    let mut data = tensor.to_data().convert::<f32>();
+    if let Ok(slice) = data.as_mut_slice::<f32>() {
+        for value in slice.iter_mut() {
+            *value = value.clamp(-2.0, 2.0);
+        }
+    }
+    Tensor::from_data(data, device)
 }
 
 /// Configuration for custom multi-head attention with RoPE
@@ -193,14 +199,14 @@ impl CustomAttentionConfig {
 
         // Combined QKV projection with LeCun normal initialization
         let qkv_size = (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim;
-        let qkv_weight = init_lecun_normal([qkv_size, self.hidden_size], self.hidden_size, device);
+        let qkv_weight = init_lecun_normal([self.hidden_size, qkv_size], self.hidden_size, device);
         let qkv_proj = Linear {
             weight: Param::from_tensor(qkv_weight),
             bias: None,
         };
 
         // Output projection with LeCun normal initialization
-        let o_weight = init_lecun_normal([self.hidden_size, output_size], output_size, device);
+        let o_weight = init_lecun_normal([output_size, self.hidden_size], output_size, device);
         let o_proj = Linear {
             weight: Param::from_tensor(o_weight),
             bias: None,
@@ -374,7 +380,7 @@ impl CustomSwiGluConfig {
 
         // Gate and up projection combined with LeCun normal initialization
         let gate_up_weight = init_lecun_normal(
-            [intermediate_size * 2, self.hidden_size],
+            [self.hidden_size, intermediate_size * 2],
             self.hidden_size,
             device,
         );
@@ -385,7 +391,7 @@ impl CustomSwiGluConfig {
 
         // Down projection with LeCun normal initialization
         let down_weight = init_lecun_normal(
-            [self.hidden_size, intermediate_size],
+            [intermediate_size, self.hidden_size],
             intermediate_size,
             device,
         );

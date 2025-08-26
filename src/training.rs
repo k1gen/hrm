@@ -4,55 +4,80 @@
 //! on Sudoku puzzles, following Burn's standard training patterns with built-in TUI support.
 
 use crate::{
-    dataset::{SudokuBatch, SudokuBatcher, SudokuData, SudokuDatasetMetadata},
-    model::{HierarchicalReasoningModel, HierarchicalReasoningModelConfig},
+    act::{ActLossHead, ActModel},
+    dataset::{SudokuBatch, SudokuBatcher, SudokuData},
 };
 use burn::{
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::Dataset},
-    optim::AdamConfig,
-    prelude::*,
+    module::Module,
     record::CompactRecorder,
-    tensor::backend::AutodiffBackend,
+    tensor::backend::{AutodiffBackend, Backend},
     train::{
-        ClassificationOutput, LearnerBuilder, TrainOutput, TrainStep, ValidStep,
+        ClassificationOutput, LearnerBuilder, LearningStrategy, TrainOutput, TrainStep, ValidStep,
         metric::{AccuracyMetric, LossMetric},
     },
 };
 
-/// Training configuration for HRM
+/// Training wrapper for HRM model that maintains carry state
+#[derive(Module, Debug)]
+pub struct HrmTrainer<B: Backend> {
+    /// The HRM model
+    pub model: ActModel<B>,
+}
+
+impl<B: Backend> HrmTrainer<B> {
+    /// Create a new HRM trainer
+    pub fn new(model: ActModel<B>) -> Self {
+        Self { model }
+    }
+}
+
+impl<B: AutodiffBackend> TrainStep<SudokuBatch<B>, ClassificationOutput<B>> for HrmTrainer<B> {
+    fn step(&self, item: SudokuBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
+        // Simple single-step forward pass
+        let mut loss_head = ActLossHead::new(self.model.clone());
+        let (classification_output, _, _) = loss_head.forward_loss(item, true);
+
+        let grads = classification_output.loss.backward();
+        TrainOutput::new(self, grads, classification_output)
+    }
+}
+
+impl<B: Backend> ValidStep<SudokuBatch<B>, ClassificationOutput<B>> for HrmTrainer<B> {
+    fn step(&self, item: SudokuBatch<B>) -> ClassificationOutput<B> {
+        let mut loss_head = ActLossHead::new(self.model.clone());
+        let (classification_output, _, _) = loss_head.forward_loss(item, false);
+        classification_output
+    }
+}
+
+/// Configuration for HRM training
 #[derive(Config)]
 pub struct HrmTrainingConfig {
-    /// Model configuration
-    pub model: HierarchicalReasoningModelConfig,
-
+    /// Inner model configuration
+    pub model: crate::model::HierarchicalReasoningModelConfig,
     /// Optimizer configuration
-    pub optimizer: AdamConfig,
-
+    #[config(default = "burn::optim::AdamConfig::new()")]
+    pub optimizer: burn::optim::AdamConfig,
     /// Number of training epochs
     #[config(default = 100)]
     pub num_epochs: usize,
-
     /// Batch size
     #[config(default = 32)]
     pub batch_size: usize,
-
     /// Number of data loader workers
     #[config(default = 4)]
     pub num_workers: usize,
-
     /// Learning rate
     #[config(default = 1e-4)]
     pub learning_rate: f64,
-
     /// Random seed for reproducibility
     #[config(default = 42)]
     pub seed: u64,
-
     /// H-level reasoning cycles during training
     #[config(default = 2)]
     pub h_cycles: usize,
-
     /// L-level reasoning cycles during training
     #[config(default = 2)]
     pub l_cycles: usize,
@@ -61,18 +86,16 @@ pub struct HrmTrainingConfig {
 impl Default for HrmTrainingConfig {
     fn default() -> Self {
         Self {
-            model: HierarchicalReasoningModelConfig {
+            model: crate::model::HierarchicalReasoningModelConfig {
                 batch_size: 32,
                 seq_len: 81,
-                vocab_size: 11, // PAD + digits 0-9 to match PyTorch
-
+                vocab_size: 11,
                 hidden_size: 512,
                 num_heads: 8,
                 h_layers: 4,
                 l_layers: 4,
                 h_cycles: 2,
                 l_cycles: 2,
-
                 expansion: 2.666,
                 pos_encodings: "rope".to_string(),
                 rms_norm_eps: 1e-5,
@@ -81,7 +104,7 @@ impl Default for HrmTrainingConfig {
                 halt_max_steps: 8,
                 halt_exploration_prob: 0.1,
             },
-            optimizer: AdamConfig::new()
+            optimizer: burn::optim::AdamConfig::new()
                 .with_weight_decay(Some(burn::optim::decay::WeightDecayConfig::new(1e-4)))
                 .with_epsilon(1e-8)
                 .with_beta_1(0.9)
@@ -94,93 +117,6 @@ impl Default for HrmTrainingConfig {
             h_cycles: 2,
             l_cycles: 2,
         }
-    }
-}
-
-/// Forward pass method for HRM model that returns ClassificationOutput
-impl<B: Backend> HierarchicalReasoningModel<B> {
-    /// Forward pass for training with loss computation
-    pub fn forward_classification(
-        &self,
-        batch: SudokuBatch<B>,
-        _metadata: &SudokuDatasetMetadata,
-        h_cycles: usize,
-        l_cycles: usize,
-    ) -> ClassificationOutput<B> {
-        let [batch_size, seq_len] = batch.inputs.dims();
-
-        // Create empty carry state
-        let carry = self.empty_carry(
-            batch_size,
-            seq_len,
-            self.embed_tokens.weight.dims()[1], // hidden_size
-            &batch.inputs.device(),
-        );
-
-        // Forward pass through the model
-        let (_, logits, _) = self.forward(carry, batch.inputs.clone(), h_cycles, l_cycles);
-
-        // Keep targets in original format: empty=1, digits=2-10 (matching PyTorch implementation)
-        // With vocab_size=11, model predicts classes 0-10, so targets 1-10 are valid
-        let targets_final = batch.targets.clone(); // Keep original 1-10 encoding
-
-        // Compute PyTorch-style cross-entropy loss
-        let loss = compute_pytorch_cross_entropy_loss(logits.clone(), targets_final.clone());
-
-        // Reshape for ClassificationOutput compatibility
-        let logits_flat = logits.flatten::<2>(0, 1);
-        let targets_flat = targets_final.flatten::<1>(0, 1);
-
-        ClassificationOutput {
-            loss,
-            output: logits_flat,
-            targets: targets_flat,
-        }
-    }
-}
-
-/// Compute cross-entropy loss matching PyTorch HRM implementation exactly
-fn compute_pytorch_cross_entropy_loss<B: Backend>(
-    logits: Tensor<B, 3>,       // [batch, seq, vocab_size]
-    targets: Tensor<B, 2, Int>, // [batch, seq]
-) -> Tensor<B, 1> {
-    let [batch_size, seq_len, _vocab_size] = logits.dims();
-
-    // Flatten for cross-entropy computation - matches PyTorch F.cross_entropy
-    let logits_flat = logits.flatten::<2>(0, 1); // [batch*seq, vocab_size]
-    let targets_flat = targets.flatten::<1>(0, 1); // [batch*seq]
-
-    // Compute per-element cross-entropy losses (reduction="none")
-    let log_probs = burn::tensor::activation::log_softmax(logits_flat, 1);
-    let targets_expanded = targets_flat.clone().unsqueeze_dim::<2>(1); // [batch*seq, 1]
-    let selected_log_probs = log_probs.gather(1, targets_expanded).squeeze::<1>(1); // [batch*seq]
-    let element_losses = -selected_log_probs; // [batch*seq]
-
-    // Reshape back to [batch, seq] for per-sequence processing
-    let losses = element_losses.reshape([batch_size, seq_len]);
-
-    // PyTorch: (element_losses / loss_divisor).sum() where loss_divisor = seq_len per sequence
-    // This means: for each sequence, divide all its losses by seq_len, then sum across all elements
-    let sequence_normalized_losses = losses / (seq_len as f32); // [batch, seq] / scalar
-    sequence_normalized_losses.sum() // Sum across all batch and sequence dimensions
-}
-
-impl<B: AutodiffBackend> TrainStep<SudokuBatch<B>, ClassificationOutput<B>>
-    for HierarchicalReasoningModel<B>
-{
-    fn step(&self, batch: SudokuBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
-        let metadata = SudokuDatasetMetadata::default();
-        let output = self.forward_classification(batch, &metadata, 2, 2);
-        TrainOutput::new(self, output.loss.backward(), output)
-    }
-}
-
-impl<B: Backend> ValidStep<SudokuBatch<B>, ClassificationOutput<B>>
-    for HierarchicalReasoningModel<B>
-{
-    fn step(&self, batch: SudokuBatch<B>) -> ClassificationOutput<B> {
-        let metadata = SudokuDatasetMetadata::default();
-        self.forward_classification(batch, &metadata, 2, 2)
     }
 }
 
@@ -217,7 +153,7 @@ fn find_latest_checkpoint(artifact_dir: &str) -> Option<usize> {
     latest_epoch
 }
 
-/// Main training function with TUI support
+/// Train HRM using Burn's standard training framework
 pub fn train<B: AutodiffBackend>(
     artifact_dir: &str,
     config: HrmTrainingConfig,
@@ -225,9 +161,10 @@ pub fn train<B: AutodiffBackend>(
     train_dataset: impl Dataset<SudokuData> + 'static,
     val_dataset: impl Dataset<SudokuData> + 'static,
 ) {
+    // Create artifact directory
     create_artifact_dir(artifact_dir);
 
-    // Check if we can resume from checkpoint
+    // Check for existing checkpoints
     let latest_checkpoint = find_latest_checkpoint(artifact_dir);
 
     if let Some(epoch) = latest_checkpoint {
@@ -237,17 +174,32 @@ pub fn train<B: AutodiffBackend>(
         );
     } else {
         println!("🆕 No existing checkpoints found. Starting fresh training...");
-
-        // Save configuration only when starting fresh
-        config
-            .save(format!("{artifact_dir}/config.json"))
-            .expect("Config should be saved successfully");
     }
+
+    // Save configuration
+    config
+        .save(format!("{artifact_dir}/config.json"))
+        .expect("Config should be saved successfully");
 
     // Set random seed
     B::seed(config.seed);
 
-    // Create batchers - different types for training and validation backends
+    // Initialize inner HRM model
+    let inner_model = config.model.init::<B>(&device);
+
+    // Create HRM wrapper
+    let hrm_model = ActModel::new(
+        inner_model,
+        config.model.halt_max_steps,
+        config.model.halt_exploration_prob,
+        config.h_cycles,
+        config.l_cycles,
+    );
+
+    // Create HRM trainer
+    let model = HrmTrainer::new(hrm_model);
+
+    // Create batchers
     let train_batcher = SudokuBatcher::<B>::new();
     let val_batcher = SudokuBatcher::<B::InnerBackend>::new();
 
@@ -264,10 +216,7 @@ pub fn train<B: AutodiffBackend>(
         .num_workers(config.num_workers)
         .build(val_dataset);
 
-    // Initialize model
-    let model = config.model.init::<B>(&device);
-
-    // Build learner with basic metrics
+    // Build learner with TUI and checkpoint support
     let learner_builder = LearnerBuilder::new(artifact_dir)
         .metric_train_numeric(AccuracyMetric::new())
         .metric_valid_numeric(AccuracyMetric::new())
@@ -276,7 +225,7 @@ pub fn train<B: AutodiffBackend>(
         .with_file_checkpointer(CompactRecorder::new())
         .num_epochs(config.num_epochs)
         .summary()
-        .learning_strategy(burn::train::LearningStrategy::SingleDevice(device.clone()));
+        .learning_strategy(LearningStrategy::SingleDevice(device));
 
     // Either resume from checkpoint or start fresh
     let learner = if let Some(checkpoint_epoch) = latest_checkpoint {
@@ -297,5 +246,8 @@ pub fn train<B: AutodiffBackend>(
         .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
         .expect("Trained model should be saved successfully");
 
-    println!("Training completed! Model saved to: {}/model", artifact_dir);
+    println!(
+        "✅ Training completed! Model saved to: {}/model",
+        artifact_dir
+    );
 }

@@ -29,11 +29,17 @@ fn init_truncated_normal<B: Backend>(
 ) -> Tensor<B, 2> {
     // Use Normal initializer directly for precise std control
     let initializer = Initializer::Normal { mean: 0.0, std };
-    let tensor = initializer
+    let tensor: Tensor<B, 2> = initializer
         .init_with(shape, None, None, device)
         .into_value();
-    // Apply truncation bounds matching PyTorch [-2.0, 2.0]
-    tensor.clamp(-2.0, 2.0)
+    // Extract data, apply truncation in-place, and create new leaf tensor
+    let mut data = tensor.to_data().convert::<f32>();
+    if let Ok(slice) = data.as_mut_slice::<f32>() {
+        for value in slice.iter_mut() {
+            *value = value.clamp(-2.0, 2.0);
+        }
+    }
+    Tensor::from_data(data, device)
 }
 
 /// Create LeCun normal initialized tensor (std = 1/sqrt(fan_in)) with truncation
@@ -47,11 +53,17 @@ fn init_lecun_normal<B: Backend>(
         gain: 1.0,
         fan_out_only: false,
     };
-    let tensor = initializer
+    let tensor: Tensor<B, 2> = initializer
         .init_with(shape, Some(fan_in), None, device)
         .into_value();
-    // Apply truncation bounds matching PyTorch [-2.0, 2.0]
-    tensor.clamp(-2.0, 2.0)
+    // Extract data, apply truncation in-place, and create new leaf tensor
+    let mut data = tensor.to_data().convert::<f32>();
+    if let Ok(slice) = data.as_mut_slice::<f32>() {
+        for value in slice.iter_mut() {
+            *value = value.clamp(-2.0, 2.0);
+        }
+    }
+    Tensor::from_data(data, device)
 }
 
 /// Configuration for the Hierarchical Reasoning Model
@@ -293,7 +305,7 @@ impl HierarchicalReasoningModelConfig {
 
         // Output heads with custom truncated LeCun normal initialization
         let lm_head_weight = init_lecun_normal(
-            [self.vocab_size, self.hidden_size],
+            [self.hidden_size, self.vocab_size],
             self.hidden_size,
             device,
         );
@@ -305,7 +317,7 @@ impl HierarchicalReasoningModelConfig {
         // Initialize Q-head with custom initialization to match PyTorch
         // PyTorch: weights=0, bias=-5 for faster bootstrapping
         let q_head_weight = Initializer::Zeros
-            .init([2, self.hidden_size], device)
+            .init([self.hidden_size, 2], device)
             .into_value();
         let q_head_bias = Tensor::from_data([-5.0, -5.0], device);
 
@@ -397,27 +409,25 @@ impl<B: Backend> HierarchicalReasoningModel<B> {
         // Token embeddings
         let mut embeddings = self.embed_tokens.forward(input);
 
-        // Scale embeddings by sqrt(hidden_size) first
-        let embed_scale = (embeddings.dims()[2] as f64).sqrt();
-        embeddings = embeddings * embed_scale;
-
-        // Position embeddings (if using learned)
+        // Position embeddings (if using learned) - BEFORE scaling
         if let Some(ref embed_pos) = self.embed_pos {
             let seq_len = embeddings.dims()[1];
-            let batch_size = embeddings.dims()[0];
 
-            // Create position indices for the sequence length
-            let positions = Tensor::arange(0..seq_len as i64, &embeddings.device())
-                .unsqueeze_dim::<2>(0)
-                .repeat_dim(0, batch_size);
+            // Use weight matrix directly to match PyTorch exactly
+            // PyTorch: embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight)
+            // This broadcasts [seq_len, hidden_size] across [batch_size, seq_len, hidden_size]
+            let pos_weights = embed_pos
+                .weight
+                .val()
+                .slice([0..seq_len, 0..embeddings.dims()[2]]);
 
-            let pos_embeddings = embed_pos.forward(positions);
-
-            // Scale by 1/sqrt(2) to maintain variance
-            embeddings = embeddings * 0.707106781 + pos_embeddings * 0.707106781;
+            // Scale by 1/sqrt(2) to maintain variance (matching PyTorch exactly)
+            embeddings = (embeddings + pos_weights.unsqueeze_dim::<3>(0)) * 0.707106781;
         }
 
-        embeddings
+        // Scale by sqrt(hidden_size) - AFTER position embeddings (matching PyTorch)
+        let embed_scale = (embeddings.dims()[2] as f64).sqrt();
+        embeddings * embed_scale
     }
 
     /// Forward pass
